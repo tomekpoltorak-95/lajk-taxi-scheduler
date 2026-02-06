@@ -123,6 +123,29 @@ def solve(req: SolveRequest):
             need = int(req.demand[dk][sh_name])
             model.Add(sum(x[(e, d, s)] for e in range(nE)) == need)
 
+    # ---------- HARD fairness: równy rozkład DNI PRACY na pracownika ----------
+total_work_required = 0
+for d in range(nD):
+    dk = dow_key(dates[d])
+    total_work_required += int(req.demand[dk]["D"]) + int(req.demand[dk]["P"]) + int(req.demand[dk]["N"])
+
+base_work = total_work_required // nE
+rem_work = total_work_required % nE
+
+# per-employee total work days
+work_count = []
+for e in range(nE):
+    wc = model.NewIntVar(0, nD, f"workcnt_e{e}")
+    model.Add(wc == sum(work[(e, d)] for d in range(nD)))
+    work_count.append(wc)
+
+    # twarde widełki: base .. base+1
+    # (jeśli masz dużo unavailability i czasem robi się "No feasible", zmień +1 na +2)
+model.Add(wc >= base_work)
+model.Add(wc <= base_work + 1)
+
+
+
     # 2) Unavailability (hard)
     for e in range(nE):
         name = names[e].strip()
@@ -233,6 +256,17 @@ def solve(req: SolveRequest):
     w_single_work = 120               # NOWE: OFF-WORK-OFF bardzo niechciane
     w_two_work = 60                   # NOWE: OFF-WORK-WORK-OFF też niechciane
     w_shift_balance = 20              # NOWE: kara za odchylenie od bazowego targetu D/P/N
+# ---------- SOFT: minimalizuj różnicę max-min liczby dni pracy ----------
+w_work_spread = 80  # do strojenia
+
+work_max = model.NewIntVar(0, nD, "work_max")
+work_min = model.NewIntVar(0, nD, "work_min")
+model.AddMaxEquality(work_max, work_count)
+model.AddMinEquality(work_min, work_count)
+work_diff = model.NewIntVar(0, nD, "work_diff")
+model.Add(work_diff == work_max - work_min)
+obj_terms.append(w_work_spread * work_diff)
+
 
     # A) Penalize single OFF between work days: WORK - OFF - WORK
     if nD >= 3:
