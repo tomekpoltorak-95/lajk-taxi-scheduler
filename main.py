@@ -10,9 +10,9 @@ app = FastAPI()
 class Config(BaseModel):
     weeks: int = 8
     max_consec_work: int = 6            # hard
-    ideal_consec_work: int = 5          # soft (wykorzystane pośrednio przez kary na krótkie bloki)
+    ideal_consec_work: int = 5          # soft (pośrednio przez kary na krótkie bloki)
     weekend_fairness_weight: int = 50   # soft
-    shift_change_penalty: int = 10      # (zostawione, ale przy hard "same shift in blocks" ma ograniczoną rolę)
+    shift_change_penalty: int = 10      # (mała rola przy hard "same shift in blocks")
     target_shifts_per_week: int = 5     # soft
     max_shifts_per_week: int = 6        # hard
 
@@ -65,12 +65,6 @@ def allowed_set(allowed: str) -> set:
     return set([p for p in parts if p in SHIFT_KEYS])
 
 
-def bounds_from_total(total_required: int, nE: int):
-    base = total_required // nE
-    rem = total_required % nE
-    return base, rem
-
-
 # ---------- SOLVER ----------
 @app.post("/solve", response_model=SolveResponse)
 def solve(req: SolveRequest):
@@ -108,7 +102,7 @@ def solve(req: SolveRequest):
             for s in range(3):
                 x[(e, d, s)] = model.NewBoolVar(f"x_e{e}_d{d}_s{s}")
 
-    # work[e,d]
+    # work[e,d] (Bool) == 1 jeśli pracuje (czyli ma D/P/N)
     work = {}
     for e in range(nE):
         for d in range(nD):
@@ -122,29 +116,6 @@ def solve(req: SolveRequest):
         for s, sh_name in enumerate(SHIFT_KEYS):
             need = int(req.demand[dk][sh_name])
             model.Add(sum(x[(e, d, s)] for e in range(nE)) == need)
-
-    # ---------- HARD fairness: równy rozkład DNI PRACY na pracownika ----------
-total_work_required = 0
-for d in range(nD):
-    dk = dow_key(dates[d])
-    total_work_required += int(req.demand[dk]["D"]) + int(req.demand[dk]["P"]) + int(req.demand[dk]["N"])
-
-base_work = total_work_required // nE
-rem_work = total_work_required % nE
-
-# per-employee total work days
-work_count = []
-for e in range(nE):
-    wc = model.NewIntVar(0, nD, f"workcnt_e{e}")
-    model.Add(wc == sum(work[(e, d)] for d in range(nD)))
-    work_count.append(wc)
-
-    # twarde widełki: base .. base+1
-    # (jeśli masz dużo unavailability i czasem robi się "No feasible", zmień +1 na +2)
-model.Add(wc >= base_work)
-model.Add(wc <= base_work + 1)
-
-
 
     # 2) Unavailability (hard)
     for e in range(nE):
@@ -186,8 +157,7 @@ model.Add(wc <= base_work + 1)
             # N(prev) -> D(curr)
             model.Add(x[(e, d - 1, 2)] + x[(e, d, 0)] <= 1)
 
-    # 6) HARD: If employee works on consecutive days, they must keep SAME shift
-    # (czyli bloki typu DDDDD / PPPPP / NNNNN — to jest Twoje wymaganie)
+    # 6) HARD: Jeśli pracuje dzień po dniu -> musi mieć tę samą zmianę (DDDDD/PPPPP/NNNNN)
     for e in range(nE):
         for d in range(1, nD):
             for s in range(3):
@@ -199,9 +169,43 @@ model.Add(wc <= base_work + 1)
                         <= 1 + (1 - work[(e, d - 1)]) + (1 - work[(e, d)])
                     )
 
+    # ============================================================
+    # NOWE: FAIRNESS na liczbę DNI PRACY (godziny)
+    # Chcemy, żeby każdy miał prawie tyle samo dni pracy w całym horyzoncie
+    # ============================================================
+    total_work_required = 0
+    for d in range(nD):
+        dk = dow_key(dates[d])
+        total_work_required += int(req.demand[dk]["D"]) + int(req.demand[dk]["P"]) + int(req.demand[dk]["N"])
+
+    base_work = total_work_required // nE
+    # reszta powie nam, ilu pracowników musi mieć +1 dzień
+    rem_work = total_work_required % nE
+
+    work_count = []
+    for e in range(nE):
+        wc = model.NewIntVar(0, nD, f"workcnt_e{e}")
+        model.Add(wc == sum(work[(e, d)] for d in range(nD)))
+        work_count.append(wc)
+
+        # twarde widełki: base..base+1
+        model.Add(wc >= base_work)
+        model.Add(wc <= base_work + 1)
+
+    # (opcjonalnie) dokładnie wymuś, że dokładnie rem_work osób ma base+1
+    # To eliminuje nawet minimalne "odchyły" przy base..base+1
+    if rem_work != 0:
+        plus1_flags = []
+        for e in range(nE):
+            f = model.NewBoolVar(f"is_plus1_e{e}")
+            # wc == base+1 <=> f=1, wc == base <=> f=0 (bo mamy już wc in [base, base+1])
+            model.Add(work_count[e] == base_work + 1).OnlyEnforceIf(f)
+            model.Add(work_count[e] == base_work).OnlyEnforceIf(f.Not())
+            plus1_flags.append(f)
+        model.Add(sum(plus1_flags) == rem_work)
+
     # ----------------------------
     # FAIRNESS: rozkład D/P/N na pracownika
-    # - LUŹNE hard bounds + SOFT kara odchylenia
     # ----------------------------
     total_by_shift = [0, 0, 0]  # D,P,N
     for d in range(nD):
@@ -219,7 +223,7 @@ model.Add(wc <= base_work + 1)
             model.Add(v == sum(x[(e, d, s)] for d in range(nD)))
             shift_counts[(e, s)] = v
 
-            # LUŹNE hard widełki, żeby nie psuć bloków/przerw przy ograniczeniach
+            # luźne hard widełki
             low = max(0, bases[s] - 1)
             high = min(nD, bases[s] + 2)
             model.Add(v >= low)
@@ -246,29 +250,23 @@ model.Add(wc <= base_work + 1)
     # ----------------------------
     obj_terms = []
 
-    # weights (strojenie pod Twoje wymagania)
+    # weights (strojenie)
     w_weekend = max(1, int(cfg.weekend_fairness_weight))
-    w_single_off = 50                 # WORK-OFF-WORK (już było)
-    w_change_sep_off = 120            # shiftA - OFF - shiftB (A!=B) (zostawiamy)
-    w_split_weekend = 80              # praca tylko w sob lub tylko w ndz
-    w_work_weekend_day = 5            # lekko zniechęcaj do pracy w weekend
-    w_block_start = 40                # NOWE: kara za start bloku pracy => dłuższe ciągi pracy
-    w_single_work = 120               # NOWE: OFF-WORK-OFF bardzo niechciane
-    w_two_work = 60                   # NOWE: OFF-WORK-WORK-OFF też niechciane
-    w_shift_balance = 20              # NOWE: kara za odchylenie od bazowego targetu D/P/N
-# ---------- SOFT: minimalizuj różnicę max-min liczby dni pracy ----------
-w_work_spread = 80  # do strojenia
+    w_single_off = 50
+    w_change_sep_off = 120
+    w_split_weekend = 80
+    w_work_weekend_day = 5
 
-work_max = model.NewIntVar(0, nD, "work_max")
-work_min = model.NewIntVar(0, nD, "work_min")
-model.AddMaxEquality(work_max, work_count)
-model.AddMinEquality(work_min, work_count)
-work_diff = model.NewIntVar(0, nD, "work_diff")
-model.Add(work_diff == work_max - work_min)
-obj_terms.append(w_work_spread * work_diff)
+    w_block_start = 40
+    w_single_work = 120
+    w_two_work = 60
 
+    w_shift_balance = 20
 
-    # A) Penalize single OFF between work days: WORK - OFF - WORK
+    # NOWE: dociskanie rozrzutu dni pracy (max-min)
+    w_work_spread = 200
+
+    # A) WORK - OFF - WORK
     if nD >= 3:
         for e in range(nE):
             for d in range(1, nD - 1):
@@ -279,8 +277,7 @@ obj_terms.append(w_work_spread * work_diff)
                 model.Add(z >= work[(e, d - 1)] + work[(e, d + 1)] + (1 - work[(e, d)]) - 2)
                 obj_terms.append(w_single_off * z)
 
-    # B) Penalize shift-change separated by ONE OFF:
-    # shift s at d-1, OFF at d, shift t at d+1, s!=t
+    # B) shiftA - OFF - shiftB, A!=B
     if nD >= 3:
         for e in range(nE):
             for d in range(1, nD - 1):
@@ -295,7 +292,7 @@ obj_terms.append(w_work_spread * work_diff)
                         model.Add(y >= x[(e, d - 1, s)] + (1 - work[(e, d)]) + x[(e, d + 1, t)] - 2)
                         obj_terms.append(w_change_sep_off * y)
 
-    # C) Weekend split penalty (XOR Sat/Sun in each week) + small discourage weekend work
+    # C) weekend split + small discourage weekend work
     for w in range(weeks):
         sat = w * 7 + 5
         sun = w * 7 + 6
@@ -308,13 +305,13 @@ obj_terms.append(w_work_spread * work_diff)
             model.Add(both >= work[(e, sat)] + work[(e, sun)] - 1)
 
             split = model.NewIntVar(0, 1, f"splitwknd_e{e}_w{w}")
-            model.Add(split == work[(e, sat)] + work[(e, sun)] - 2 * both)  # 0,1,0
+            model.Add(split == work[(e, sat)] + work[(e, sun)] - 2 * both)
             obj_terms.append(w_split_weekend * split)
 
             obj_terms.append(w_work_weekend_day * work[(e, sat)])
             obj_terms.append(w_work_weekend_day * work[(e, sun)])
 
-    # D) Minimize spread of Sat & Sun counts (soft)
+    # D) minimize spread Sat/Sun counts
     if sat_indices:
         sat_max = model.NewIntVar(0, len(sat_indices), "sat_max")
         sat_min = model.NewIntVar(0, len(sat_indices), "sat_min")
@@ -333,7 +330,7 @@ obj_terms.append(w_work_spread * work_diff)
         model.Add(sun_diff == sun_max - sun_min)
         obj_terms.append(w_weekend * sun_diff)
 
-    # E) Keep weekly shifts near target (light)
+    # E) weekly target (soft, ale teraz wciąż dość lekko)
     target = int(cfg.target_shifts_per_week)
     if target > 0:
         for e in range(nE):
@@ -346,9 +343,9 @@ obj_terms.append(w_work_spread * work_diff)
                 model.Add(wk_shifts == sum(work[(e, d)] for d in range(start, end)))
                 dev = model.NewIntVar(0, 7, f"dev_e{e}_w{w}")
                 model.AddAbsEquality(dev, wk_shifts - target)
-                obj_terms.append(1 * dev)
+                obj_terms.append(10 * dev)  # było 1, podbijamy bo to pomaga tygodniowo
 
-    # F) NOWE: minimalizuj liczbę startów bloków pracy => dłuższe ciągi pracy
+    # F) minimalizuj liczbę startów bloków pracy
     for e in range(nE):
         obj_terms.append(w_block_start * work[(e, 0)])
         for d in range(1, nD):
@@ -358,7 +355,7 @@ obj_terms.append(w_work_spread * work_diff)
             model.Add(start_blk >= work[(e, d)] - work[(e, d - 1)])
             obj_terms.append(w_block_start * start_blk)
 
-    # G) NOWE: karz krótkie bloki pracy (OFF-W-OFF i OFF-W-W-OFF)
+    # G) karz krótkie bloki pracy: OFF-W-OFF i OFF-W-W-OFF
     if nD >= 3:
         for e in range(nE):
             for d in range(1, nD - 1):
@@ -380,7 +377,7 @@ obj_terms.append(w_work_spread * work_diff)
                 model.Add(two >= (1 - work[(e, d - 1)]) + work[(e, d)] + work[(e, d + 1)] + (1 - work[(e, d + 2)]) - 3)
                 obj_terms.append(w_two_work * two)
 
-    # H) NOWE: soft równoważenie D/P/N względem base (żeby było "prawie równo")
+    # H) soft równoważenie D/P/N względem base
     for e in range(nE):
         for s in range(3):
             v = shift_counts[(e, s)]
@@ -388,6 +385,15 @@ obj_terms.append(w_work_spread * work_diff)
             dev = model.NewIntVar(0, nD, f"dev_cnt_e{e}_s{s}")
             model.AddAbsEquality(dev, v - tgt)
             obj_terms.append(w_shift_balance * dev)
+
+    # I) soft: dociskaj różnicę (max-min) dni pracy
+    work_max = model.NewIntVar(0, nD, "work_max")
+    work_min = model.NewIntVar(0, nD, "work_min")
+    model.AddMaxEquality(work_max, work_count)
+    model.AddMinEquality(work_min, work_count)
+    work_diff = model.NewIntVar(0, nD, "work_diff")
+    model.Add(work_diff == work_max - work_min)
+    obj_terms.append(w_work_spread * work_diff)
 
     model.Minimize(sum(obj_terms))
 
