@@ -222,6 +222,33 @@ def solve(req: SolveRequest):
         model.Add(uv >= sun_base)
         model.Add(uv <= sun_base + 1)
 
+        # ============================================================
+    # FAIRNESS: rozkład D/P/N na pracownika (hard bounds base..base+1)
+    # ============================================================
+    total_by_shift = [0, 0, 0]  # D,P,N
+    for d in range(nD):
+        dk = dow_key(dates[d])
+        total_by_shift[0] += int(req.demand[dk]["D"])
+        total_by_shift[1] += int(req.demand[dk]["P"])
+        total_by_shift[2] += int(req.demand[dk]["N"])
+
+    bases = [total_by_shift[s] // nE for s in range(3)]
+    rems  = [total_by_shift[s] %  nE for s in range(3)]
+
+    # Liczniki per pracownik
+    shift_counts = {}  # (e,s) -> IntVar
+    for e in range(nE):
+        for s in range(3):
+            v = model.NewIntVar(0, nD, f"cnt_e{e}_s{s}")
+            model.Add(v == sum(x[(e, d, s)] for d in range(nD)))
+            shift_counts[(e, s)] = v
+
+            # Twarde widełki base..base+1
+            # (wystarczy, żeby rozkład był bardzo równy i bez patologii)
+            model.Add(v >= bases[s])
+            model.Add(v <= bases[s] + 1)
+
+
     # ----------------------------
     # OBJECTIVE (soft): blocks + nicer weekends
     # ----------------------------
