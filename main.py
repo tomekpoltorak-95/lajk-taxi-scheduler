@@ -6,14 +6,13 @@ from ortools.sat.python import cp_model
 
 app = FastAPI()
 
-
 # ---------- MODELE ----------
 class Config(BaseModel):
     weeks: int = 8
     max_consec_work: int = 6            # hard
     ideal_consec_work: int = 5          # soft
-    weekend_fairness_weight: int = 10   # used as weights in objective (not hard weekend fairness)
-    shift_change_penalty: int = 3
+    weekend_fairness_weight: int = 50   # strong soft weights
+    shift_change_penalty: int = 10      # stronger stability
     target_shifts_per_week: int = 5     # soft
     max_shifts_per_week: int = 6        # hard
 
@@ -64,6 +63,14 @@ def allowed_set(allowed: str) -> set:
         return set()
     parts = [p.strip() for p in a.replace(";", ",").split(",") if p.strip()]
     return set([p for p in parts if p in SHIFT_KEYS])
+
+
+def bounds_from_total(total_required: int, nE: int):
+    """Return base and remainder for fair distribution across employees."""
+    base = total_required // nE
+    rem = total_required % nE
+    # feasible bound is either base or base+1
+    return base, rem
 
 
 # ---------- SOLVER ----------
@@ -152,54 +159,56 @@ def solve(req: SolveRequest):
                 break
             model.Add(sum(work[(e, d)] for d in range(start, end)) <= max_week)
 
-    # ==========================================================
-    # 6) HARD: Weekend fairness (days Sat+Sun across whole horizon)
-    #    This prevents the crazy imbalance you saw.
-    #
-    #    We count weekend DAYS worked (not boolean "weekend used").
-    #    Total weekend work-days is fixed by demand; we split it fairly.
-    # ==========================================================
-    weekend_day_indices = []
-    for d in range(nD):
-        wd = dates[d].weekday()  # Mon=0..Sun=6
-        if wd in (5, 6):         # Sat=5, Sun=6
-            weekend_day_indices.append(d)
+    # ----------------------------
+    # WEEKEND FAIRNESS (SAT & SUN separately) — strong + safe (not over-hard)
+    # ----------------------------
+    sat_indices = [d for d in range(nD) if dates[d].weekday() == 5]
+    sun_indices = [d for d in range(nD) if dates[d].weekday() == 6]
 
-    total_weekend_days_required = 0
-    # compute required weekend day staffing from demand
-    for d in weekend_day_indices:
-        dk = dow_key(dates[d])
-        total_weekend_days_required += int(req.demand[dk]["D"]) + int(req.demand[dk]["P"]) + int(req.demand[dk]["N"])
+    def total_required_on(indices: List[int]) -> int:
+        tot = 0
+        for d in indices:
+            dk = dow_key(dates[d])
+            tot += int(req.demand[dk]["D"]) + int(req.demand[dk]["P"]) + int(req.demand[dk]["N"])
+        return tot
 
-    # target distribution
-    base = total_weekend_days_required // nE
-    rem = total_weekend_days_required % nE
-    # If divisible -> exact. Else -> [base, base+1]
-    wk_targets = []
+    total_sat = total_required_on(sat_indices)
+    total_sun = total_required_on(sun_indices)
+
+    sat_base, sat_rem = bounds_from_total(total_sat, nE)
+    sun_base, sun_rem = bounds_from_total(total_sun, nE)
+
+    # Count sat/sun days worked per employee
+    sat_work = []
+    sun_work = []
     for e in range(nE):
-        wk_targets.append(base + (1 if e < rem else 0))
+        sv = model.NewIntVar(0, len(sat_indices), f"sat_e{e}")
+        uv = model.NewIntVar(0, len(sun_indices), f"sun_e{e}")
+        model.Add(sv == sum(work[(e, d)] for d in sat_indices))
+        model.Add(uv == sum(work[(e, d)] for d in sun_indices))
+        sat_work.append(sv)
+        sun_work.append(uv)
 
-    # weekend_days_worked[e] == wk_targets[e] (or between base/base+1 if you prefer)
-    weekend_days_worked = []
-    for e in range(nE):
-        v = model.NewIntVar(0, len(weekend_day_indices), f"wkdays_e{e}")
-        model.Add(v == sum(work[(e, d)] for d in weekend_day_indices))
-        weekend_days_worked.append(v)
-        # HARD fairness:
-        model.Add(v == wk_targets[e])
+        # HARD bounds: each employee must be within [base, base+1]
+        model.Add(sv >= sat_base)
+        model.Add(sv <= sat_base + 1)
+        model.Add(uv >= sun_base)
+        model.Add(uv <= sun_base + 1)
 
-    # ---------- OBJECTIVE (soft) ----------
+    # ----------------------------
+    # OBJECTIVE: stability + weekend quality
+    # ----------------------------
     obj_terms = []
 
-    # Weights (stronger stability)
-    change_pen = max(0, int(cfg.shift_change_penalty)) * 8  # much stronger than before
-    single_off_pen = max(5, int(cfg.shift_change_penalty) * 6)
-    short_run_1_pen = 20
-    short_run_2_pen = 10
-    split_weekend_pen = max(20, int(cfg.weekend_fairness_weight) * 4)
+    w_weekend = max(1, int(cfg.weekend_fairness_weight))
+    w_change = max(0, int(cfg.shift_change_penalty)) * 10
+    w_single_off = 40
+    w_iso_shift = 30
+    w_run2_shift = 15
+    w_split_weekend = 60
 
     # A) Penalize shift changes day-to-day (working both days, different shift)
-    if change_pen > 0:
+    if w_change > 0:
         for e in range(nE):
             for d in range(1, nD):
                 for s in range(3):
@@ -210,22 +219,20 @@ def solve(req: SolveRequest):
                         model.Add(y <= x[(e, d - 1, s)])
                         model.Add(y <= x[(e, d, t)])
                         model.Add(y >= x[(e, d - 1, s)] + x[(e, d, t)] - 1)
-                        obj_terms.append(change_pen * y)
+                        obj_terms.append(w_change * y)
 
     # B) Penalize single OFF between working days: work(d-1)=1, work(d)=0, work(d+1)=1
-    if single_off_pen > 0 and nD >= 3:
+    if nD >= 3:
         for e in range(nE):
             for d in range(1, nD - 1):
                 z = model.NewBoolVar(f"singleoff_e{e}_d{d}")
-                # z == 1 if work(d-1)=1 and work(d)=0 and work(d+1)=1
                 model.Add(z <= work[(e, d - 1)])
                 model.Add(z <= work[(e, d + 1)])
                 model.Add(z <= 1 - work[(e, d)])
                 model.Add(z >= work[(e, d - 1)] + work[(e, d + 1)] + (1 - work[(e, d)]) - 2)
-                obj_terms.append(single_off_pen * z)
+                obj_terms.append(w_single_off * z)
 
-    # C) Prefer longer blocks of same shift:
-    #    Penalize isolated 1-day run: s at d, but not s at d-1 and not s at d+1
+    # C) Penalize isolated 1-day run of same shift (encourage blocks)
     if nD >= 3:
         for e in range(nE):
             for d in range(1, nD - 1):
@@ -235,10 +242,9 @@ def solve(req: SolveRequest):
                     model.Add(iso <= 1 - x[(e, d - 1, s)])
                     model.Add(iso <= 1 - x[(e, d + 1, s)])
                     model.Add(iso >= x[(e, d, s)] - x[(e, d - 1, s)] - x[(e, d + 1, s)])
-                    obj_terms.append(short_run_1_pen * iso)
+                    obj_terms.append(w_iso_shift * iso)
 
-    # D) Penalize 2-day run surrounded by different (encourage >=3):
-    #    x(d,s)=1 and x(d+1,s)=1 but x(d-1,s)=0 and x(d+2,s)=0
+    # D) Penalize 2-day run surrounded by different (encourage >=3 days blocks)
     if nD >= 4:
         for e in range(nE):
             for d in range(1, nD - 2):
@@ -248,28 +254,27 @@ def solve(req: SolveRequest):
                     model.Add(run2 <= x[(e, d + 1, s)])
                     model.Add(run2 <= 1 - x[(e, d - 1, s)])
                     model.Add(run2 <= 1 - x[(e, d + 2, s)])
-                    # lower bound
                     model.Add(run2 >= x[(e, d, s)] + x[(e, d + 1, s)] - x[(e, d - 1, s)] - x[(e, d + 2, s)] - 1)
-                    obj_terms.append(short_run_2_pen * run2)
+                    obj_terms.append(w_run2_shift * run2)
 
-    # E) Weekend split penalty: works exactly one of (Sat,Sun) within the same week
-    if split_weekend_pen > 0:
-        for w in range(weeks):
-            sat = w * 7 + 5
-            sun = w * 7 + 6
-            if sat >= nD:
-                continue
-            for e in range(nE):
-                if sun >= nD:
-                    continue
-                split = model.NewBoolVar(f"splitwknd_e{e}_w{w}")
-                # split == 1 if sat+sun == 1
-                model.Add(split <= work[(e, sat)] + work[(e, sun)])
-                model.Add(split <= 2 - (work[(e, sat)] + work[(e, sun)]))
-                model.Add(split >= work[(e, sat)] + work[(e, sun)] - 1)
-                obj_terms.append(split_weekend_pen * split)
+    # E) Penalize "split weekend" correctly (XOR Sat vs Sun within the same week)
+    for w in range(weeks):
+        sat = w * 7 + 5
+        sun = w * 7 + 6
+        if sat >= nD or sun >= nD:
+            continue
+        for e in range(nE):
+            both = model.NewBoolVar(f"bothwknd_e{e}_w{w}")
+            model.Add(both <= work[(e, sat)])
+            model.Add(both <= work[(e, sun)])
+            model.Add(both >= work[(e, sat)] + work[(e, sun)] - 1)
 
-    # F) Soft: keep weekly shifts near target (small weight now)
+            split = model.NewIntVar(0, 1, f"splitwknd_e{e}_w{w}")
+            # split = sat + sun - 2*both  (0,1,0)
+            model.Add(split == work[(e, sat)] + work[(e, sun)] - 2 * both)
+            obj_terms.append(w_split_weekend * split)
+
+    # F) Soft: keep weekly shifts near target (light)
     target = int(cfg.target_shifts_per_week)
     if target > 0:
         for e in range(nE):
@@ -280,22 +285,37 @@ def solve(req: SolveRequest):
                     break
                 wk_shifts = model.NewIntVar(0, 7, f"wksh_e{e}_w{w}")
                 model.Add(wk_shifts == sum(work[(e, d)] for d in range(start, end)))
+
                 dev = model.NewIntVar(0, 7, f"dev_e{e}_w{w}")
                 model.AddAbsEquality(dev, wk_shifts - target)
                 obj_terms.append(1 * dev)
 
+    # G) Soft: also minimize spread of Sat and Sun counts (extra safety)
+    sat_max = model.NewIntVar(0, len(sat_indices), "sat_max")
+    sat_min = model.NewIntVar(0, len(sat_indices), "sat_min")
+    model.AddMaxEquality(sat_max, sat_work)
+    model.AddMinEquality(sat_min, sat_work)
+    sat_diff = model.NewIntVar(0, len(sat_indices), "sat_diff")
+    model.Add(sat_diff == sat_max - sat_min)
+    obj_terms.append(w_weekend * sat_diff)
+
+    sun_max = model.NewIntVar(0, len(sun_indices), "sun_max")
+    sun_min = model.NewIntVar(0, len(sun_indices), "sun_min")
+    model.AddMaxEquality(sun_max, sun_work)
+    model.AddMinEquality(sun_min, sun_work)
+    sun_diff = model.NewIntVar(0, len(sun_indices), "sun_diff")
+    model.Add(sun_diff == sun_max - sun_min)
+    obj_terms.append(w_weekend * sun_diff)
+
     model.Minimize(sum(obj_terms))
 
     solver = cp_model.CpSolver()
-    solver.parameters.max_time_in_seconds = 20.0
+    solver.parameters.max_time_in_seconds = 25.0
     solver.parameters.num_search_workers = 8
 
     status = solver.Solve(model)
     if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-        raise HTTPException(
-            status_code=400,
-            detail="No feasible schedule found. Try more staff or relax constraints."
-        )
+        raise HTTPException(status_code=400, detail="No feasible schedule found. Try more staff or relax constraints.")
 
     # Build matrix
     matrix = []
